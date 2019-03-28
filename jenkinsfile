@@ -1,0 +1,218 @@
+
+pipeline {
+    agent none
+    parameters {
+      text (name: 'DBC_DIR',
+            defaultValue: '/dbc/w3-dbc403/rshashibhush',
+            description: 'Path to store results of the tests.')
+      string (name: 'TestBed_name',
+            defaultValue: 'Dimension-1001',
+            description: 'Names of the deployed testbed.')
+      text (name: 'Json_Path',
+            defaultValue: 'http://w3-dbc403/rshashibhush/Testbed-Json/',
+            description: 'Path of nimbus testbed json file .')
+      string (name: 'esx_build_no',
+            defaultValue: 'ob-11940159',
+            description: ' Esx Build no to be used')
+      text (name: 'Jar_Path',
+            defaultValue: 'http://w3-dbc403.eng.vmware.com/rshashibhush/agent/agent.jar',
+            description: 'Path of agent jar to be used to make centos vm as slave')
+       text (name: 'Common_Json_Path',
+            defaultValue: 'http://w3-dbc403.eng.vmware.com/rshashibhush',
+            description: 'Common path of json file.')
+   }
+    environment {
+      DBC_DIR = "${params.DBC_DIR}"
+      TestBed_name = "${params.TestBed_name}"
+      Json_Path = "${params.Json_Path}"
+      esx_build_no = "${params.esx_build_no}"
+      Jar_Path = "${Jar_Path}"
+      vlan_Interface_file='/etc/sysconfig/network-scripts/ifcfg-ens34'
+      file='/etc/sysconfig/network-scripts/ifcfg-ens34'
+      Common_Json_Path = "${params.Common_Json_Path}"
+   }
+
+    stages {
+          stage('Stage create_order ') {
+            agent {
+                label 'nimbus-cloud'
+              }
+                steps {
+                        git credentialsId: 'nimbus-local', url: 'https://gitlab.eng.vmware.com/fractal/fractal-testautomation.git'
+                         sh '''export PYTHONPATH=$WORKSPACE
+                            echo $PYTHONPATH
+                            export OPENAPI_GENERATOR_VERSION=3.3.4
+                            python test/unit_testcases.py '''
+                    }
+                   post {
+                    always {
+                            archiveArtifacts artifacts: '**/ssdc_details.json'
+                            sh '''cd /home/worker/
+                              rm -rf ssdc_details.json
+                              wget "https://jenkins-butler.svc.eng.vmware.com/job/${JOB_NAME}/${BUILD_NUMBER}/artifact/output/ssdc_details.json" '''
+                           }
+                    failure {
+                        echo " The order creation is failed "
+                    }
+                    success{
+                        echo " The order creation is  successfully completed "
+                    }
+                }
+
+             }
+        stage('Stage nimbus_deploy') {
+            agent {
+                label 'nimbus-cloud'
+             }
+             steps {
+                git credentialsId: 'nimbus-local', url: 'https://gitlab.eng.vmware.com/fractal/fractal-testautomation.git'
+                sh '''  export PYTHONPATH=$WORKSPACE
+                        echo "$WORKSPACE"
+                        python test/create_nimbus_tb.py  -i /home/worker/ssdc_details.json -o $WORKSPACE/deploytestbed.json
+                        mv $WORKSPACE/deploytestbed.json $DBC_DIR/Testbed-Json/
+                        /mts/git/bin/nimbus-testbeddeploy --testbedSpecJsonFile ${Json_Path}/deploytestbed.json --isolated-testbed --runName ${TestBed_name} --keepVMsOnFailure --esxBuild ${esx_build_no} --lease 7 --resultsDir $DBC_DIR/results/${TestBed_name}'''
+
+             }
+             post {
+                failure {
+                    echo 'Nimbus deployment is  failed '
+                    }
+                }
+        }
+        stage('Stage Centos_ip_fetch') {
+            agent {
+                label 'nimbus-cloud'
+              }
+                steps {
+                       echo " fetching the Centos machine ip ...."
+                     sh '''echo `grep -A 2 "vmc-centos" $DBC_DIR/results/${TestBed_name}/testbedInfo.json | grep ip4 | cut -d ":" -f 2` >  play.properties
+                        sed -i -e \'s/"//g\' -e \'s/,//\' play.properties
+                        IP=`cat play.properties`
+                        echo ip=$IP > play.properties '''
+                        stash 'play.properties'
+                     sh '''cd /home/worker/
+                         cp ssdc_details.json $DBC_DIR '''
+                     }
+                   post {
+                     failure {
+                       echo 'centos ip could not be fetched  '
+                    }
+                    success {
+                       echo 'centos ip  is  fetched and continuing for furtger stage .. '
+                    }
+                 }
+                }
+       stage('Stage Centos up as slave') {
+            agent {
+                label 'nimbus-cloud'
+              }
+               steps {
+                   retry (3) {
+                        unstash 'play.properties'
+                   sh '''export BUILD_ID=dontKillMe
+                        source ./play.properties
+                        echo "logging in centos : ${ip} and making it as slave "
+                        /usr/bin/expect <<EOF
+                        spawn ssh -o StrictHostKeyChecking=no root@${ip}
+                        expect ".*assword:*"
+                        send -- "root123\\r"
+                        sleep 10
+                        send -- "wget ${Jar_Path}\\r"
+                        sleep 10
+                        send -- "nohup /usr/bin/java -jar agent.jar -jnlpUrl 'https://jenkins-butler.svc.eng.vmware.com/computer/worker/slave-agent.jnlp' -secret 'bd0640dea656d333a49442d8837d29df323e14abe64ba534f11cc677d8eda392' -workDir '/home/worker/'&\\r"
+                        sleep 10
+                        expect eof '''
+                }
+               }
+        post {
+                failure {
+                    echo 'centos   is  not able to come up as slave  '
+                    }
+                success {
+                    echo 'centos is up as slave for further stage execution ..'
+                    }
+                }
+          }
+        stage('Stage Centos_configuration') {
+            agent {
+                label 'centos_vm'
+              }
+                steps {
+                    sh '''export PYTHONPATH=$WORKSPACE
+                         rm -rf $WORKSPACE/fractal-testautomation
+                         rm -f ssdc_details.json testbedInfo.json
+                         wget "${Common_Json_Path}/ssdc_details.json"
+                         git clone https://rshashibhushan:aU9JGY25VCf-xxSfLG4Y@gitlab.eng.vmware.com/fractal/fractal-testautomation.git
+                         wget "${Common_Json_Path}/results/${TestBed_name}/testbedInfo.json"
+                         VLAN=`grep -A 4 '"network_configs"' ssdc_details.json | grep "vlan" | cut -d ":" -f 2 | sed -e \'s/"//g\' -e \'s/,//g\' -e \'s/ //g\'`
+                         echo "vlan is $VLAN"
+                         Interface_file=${vlan_Interface_file}.$VLAN
+                         echo " configuring centos configuration and activating velo cloud ........"
+                         /root/Change_centos_ip_and_activate_velo.sh $WORKSPACE/ssdc_details.json ${vlan_Interface_file}
+                         echo " configuring esx mgmt vlan ........"
+                         python fractal-testautomation/test/config_vlan_on_esx_mgmt_prt_grp.py -i $WORKSPACE/testbedInfo.json  -v $VLAN
+                         sleep 10
+                         echo " configuring centos vlan configuration ........"
+                         /root/Configure_centos_vlan.sh $WORKSPACE/ssdc_details.json $VLAN $Interface_file '''
+             }
+          post {
+                failure {
+                    echo 'centos  configuration is failed  '
+                    }
+                success {
+                    echo 'centos configuration is passed ..'
+                    }
+                }
+        }
+        stage('Stage Start_Bootstrap') {
+            agent {
+                label 'nimbus-cloud'
+              }
+                steps {
+                       sh ''' cd /home/worker
+                              ./populate_bootstrap.sh
+                              export AWS_ACCESS_KEY_ID=ASIA6INULUM3J7X5WZ5R
+                              export AWS_SECRET_ACCESS_KEY=WzSrkS8cVqVpbp4F7cWTsqIQIefz57VepNcSZvN8
+                              export AWS_SESSION_TOKEN=FQoGZXIvYXdzEPn//////////wEaDM92JtDWyhf53r1kwCL6AaibZNGF2rVd+/soGCeaZCudMwcrJTmP5fG89GW+IYHb9IvTP5lyjaElq+GnEsxNKfBAJIliH4W49WnpZ6H4AopPZHenpNyYxchOG0+t+tRvTLhGN9bZ8CJ45T2zCfLhncUQDYRwQTVVrfFYGQ44+BoUzejsrv3KLkwB1Wya1ApgHRWdoGVWeK4uVRVMVbuyYSiJWhloGDL4Augj4NDFM+6PZLGM7lh6z57rm9i8FJFzZ5nvHHmwCJ1XoEqkdjyT1JuFJ0OhV9tNZv009u8ZTXKbFJqrls+b4c5wK+4sX6otAPxmF9nRXHBkcvezOuZ/f31Fztk5fACQAFUouoHU5AU=
+                              ip=`curl ifconfig.me`
+                              echo $ip
+                              #aws ec2 run-instances --image-id ami-06cb8b877ee91a93b --count 1 --instance-type t2.micro --key-name AMI_CENTOS --security-group-ids sg-00a4b7ed93c966f68 --subnet-id subnet-0317aa6acc5e1c2ab --region us-east-2 --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=shashi-test1}]' --block-device-mappings "[{\"DeviceName\":\"/dev/sdf\",\"Ebs\":{\"VolumeSize\":50,\"DeleteOnTermination\":false}}]" --user-data file://test.sh
+                              aws ec2 run-instances --image-id ami-0118892e07a3ae66d --count 1 --instance-type m5d.large --key-name AMI_CENTOS --security-group-ids sg-00a4b7ed93c966f68 --subnet-id subnet-0317aa6acc5e1c2ab --region us-east-2 --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=fractal_test}]' > test.txt
+                              sleep 10
+                              instance_id=`cat test.txt | grep "InstanceId" |  cut -d ":" -f 2 | sed -e 's/"//g' -e 's/,//g'`
+                              echo $instance_id
+                              public_ip=`aws ec2 describe-instances --instance-ids ws ec2 describe-instances --instance-ids $instance_id --region us-east-2 | grep PublicIpAddress | awk -F ":" '{print $2}' | sed -e 's/[",]//g' -e 's/ //g'`
+                              sleep 360
+                              aws ec2 authorize-security-group-ingress --group-id sg-00a4b7ed93c966f68 --protocol tcp --port 22 --cidr $ip/32 --region us-east-2
+                              sleep 120
+                              scp -i /home/worker/AMI_CENTOS.pem -o StrictHostKeyChecking=no /home/worker/bootstrap_config  centos@$public_ip:/opt/vmware/dimension/poc/
+                              sleep 5
+                              echo "starting bootstrap ........."
+                              ssh -i /home/worker/AMI_CENTOS.pem -o StrictHostKeyChecking=no centos@$public_ip  'sudo su;cd /opt/vmware/dimension/poc/;nohup ./bootstrap_edge.sh /opt/vmware/dimension/poc/bootstrap_config Nimbus /bootstrap/edge-bundle.tar.gz' '''
+             }
+          post {
+                failure {
+                    echo 'Bootstrap is failed  '
+                    }
+                success {
+                    echo 'Bootstrap  is passed ..'
+                    }
+                }
+          }
+        stage('Stage Start_Test') {
+            agent {
+                label 'centos_vm'
+              }
+                steps {
+                   sh '''echo " Starting the test ......... "
+                        git clone https://gitlab-ci-token:Zkk8s_RWqPCZs2acjb3S@gitlab.eng.vmware.com/core-build/lanier-goat.git
+                        #cp ssdc_details.json lanier-goat/fractal/conf
+                        cd lanier-goat
+                        #python rst.py -i bat/ems/verifications.py --debug-mode -x setup-details=conf/setup_details.json
+                        #racetrack_id=`grep "url" /tmp/test-rst-root*/racetrack.json`
+                        #echo $racetrack_id'''
+             }
+
+        }
+    }
+}
